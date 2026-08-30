@@ -784,7 +784,9 @@ class PolicyInference:
         obs_batch = obs.reshape(1, -1)
         action = self.ort_session.run([self.output_name], {self.input_name: obs_batch})[0]
         action = action.squeeze(0).astype(np.float32)
-        self.last_action = action.copy()
+        # The obs contract's last-action slot is 14-D — store the body slice,
+        # not the full v2 action vector, or next tick's obs is misaligned.
+        self.last_action = action[:self.n_joints].copy()
         return action
 
     def apply_action(self, action):
