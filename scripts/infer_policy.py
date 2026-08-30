@@ -776,6 +776,11 @@ class PolicyInference:
     def infer(self):
         """Run policy inference and return action."""
         obs = self.get_observations()
+        # v2-family policies (jaw graft) expect extra obs dims the sim doesn't
+        # have yet — pad with zeros (jaw angle 0, contact 0 = dormant channel).
+        want = self.ort_session.get_inputs()[0].shape[1]
+        if isinstance(want, int) and obs.shape[0] < want:
+            obs = np.concatenate([obs, np.zeros(want - obs.shape[0], dtype=obs.dtype)])
         obs_batch = obs.reshape(1, -1)
         action = self.ort_session.run([self.output_name], {self.input_name: obs_batch})[0]
         action = action.squeeze(0).astype(np.float32)
@@ -789,9 +794,9 @@ class PolicyInference:
             delayed_index = (self.buffer_index - self.current_lag) % len(self.action_buffer)
             delayed_action = self.action_buffer[delayed_index]
             self.buffer_index = (self.buffer_index + 1) % len(self.action_buffer)
-            target_positions = self.default_pose + delayed_action * self.action_scale
+            target_positions = self.default_pose + delayed_action[:self.n_joints] * self.action_scale
         else:
-            target_positions = self.default_pose + action * self.action_scale
+            target_positions = self.default_pose + action[:self.n_joints] * self.action_scale
 
         self.data.ctrl[:] = target_positions
         # Legacy mode: head_offset is an external perturbation added on top of
