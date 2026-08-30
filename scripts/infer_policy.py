@@ -147,10 +147,8 @@ class PolicyInference:
         self.delay_max_lag = delay_max_lag
         self.switch_threshold = switch_threshold
         # Manual jaw (the human is the jaw policy until PPO unfreezes the
-        # grafted channel): 'm' toggles open/closed; closing near a sock grabs
-        # it (magnetic beak), opening releases.
+        # grafted channel): 'm' toggles open/closed.
         self.jaw_frac = 1.0        # 1 = open, 0 = closed
-        self.grasped = None        # (name, qpos_adr, dof_adr, geom_id)
         # When True: emit the unified 13D command vector and treat head_offset /
         # body_cmd as policy COMMANDS (no add to ctrl, no joint_pos correction).
         # When False: legacy behaviour (3D command, head_offset added to ctrl[5:9]).
@@ -663,46 +661,6 @@ class PolicyInference:
         self.command[1] = np.sin(2 * np.pi * self.ground_pick_phase)
         self.command[2] = 0.0
 
-    def update_grasp(self):
-        """Magnetic beak, jaw-keyed: closing the jaw near a sock grabs it
-        (contacts off, rides under the jaw); opening releases it."""
-        mouth_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "jaw")
-        if mouth_id < 0:  # rigid-jaw models: measure from the head
-            mouth_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
-        if mouth_id < 0:
-            return
-        mouth = self.data.xpos[mouth_id]
-        if self.grasped is None:
-            if self.jaw_frac > 0.5:  # jaw open: nothing to do
-                return
-            for name in ("sock_red", "sock_blue", "sock_green", "sock_yellow"):
-                bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
-                if bid < 0:
-                    continue
-                d = np.linalg.norm((self.data.xpos[bid] - mouth)[:2])
-                if d < 0.15:
-                    jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name + "_free")
-                    gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name + "_geom")
-                    self.grasped = (name, self.model.jnt_qposadr[jid],
-                                    self.model.jnt_dofadr[jid], gid)
-                    self.model.geom_contype[gid] = 0
-                    self.model.geom_conaffinity[gid] = 0
-                    print(f"GRASPED {name}")
-                    break
-        else:
-            name, qadr, dadr, gid = self.grasped
-            if self.jaw_frac > 0.5:  # jaw opened: release
-                self.data.qvel[dadr:dadr + 6] = 0.0
-                self.model.geom_contype[gid] = 1
-                self.model.geom_conaffinity[gid] = 1
-                print(f"RELEASED {name}")
-                self.grasped = None
-            else:
-                self.data.qpos[qadr:qadr + 3] = [mouth[0], mouth[1],
-                                                 max(mouth[2] - 0.03, 0.02)]
-                self.data.qpos[qadr + 3:qadr + 7] = [1, 0, 0, 0]
-                self.data.qvel[dadr:dadr + 6] = 0.0
-
     def trigger_behavior(self, name):
         """Start an episodic behavior (kick_left / kick_right / roulade).
 
@@ -841,8 +799,9 @@ class PolicyInference:
                 jaw_angle = -float(self.data.qpos[self.jaw_qpos_idx]) / 0.52  # 1 = open
             else:
                 jaw_angle = self.jaw_frac
-            jaw_obs = np.array([jaw_angle, 1.0 if self.grasped else 0.0],
-                               dtype=obs.dtype)
+            # obs[62] jaw contact: stubbed at 0 — the grasp mechanics and the
+            # real contact/current signal are deliberately out of scope here.
+            jaw_obs = np.array([jaw_angle, 0.0], dtype=obs.dtype)
             pad = jaw_obs[:want - obs.shape[0]]
             obs = np.concatenate([obs, pad])
         obs_batch = obs.reshape(1, -1)
@@ -1222,13 +1181,13 @@ def main():
                 policy.set_vel_cmd(0.25, 0.0, -0.8)
                 print("Vel cmd: [0.25, 0.00, -0.80] [arc CW]")
             elif key == "m":
-                # Manual jaw: you are the jaw policy. Close near a sock to
-                # grab it; open to release. (The grafted v2 net's jaw channel
-                # is dormant — this is intent-driven, like the real robot.)
+                # Manual jaw: you are the jaw policy. (The grafted v2 net's
+                # jaw channel is dormant — this is intent-driven, like the
+                # real robot's mouth intent.)
                 policy.jaw_frac = 0.0 if policy.jaw_frac > 0.5 else 1.0
                 state = 'OPEN' if policy.jaw_frac > 0.5 else 'CLOSED'
                 # Visual feedback: the beak geoms tint red while closed
-                # (the sim jaw has no joint, so this is the visible "bite").
+                # (on rigid-jaw models this is the visible "bite").
                 bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
                 if bid >= 0:
                     adr, num = model.body_geomadr[bid], model.body_geomnum[bid]
@@ -1238,16 +1197,7 @@ def main():
                         model.geom_rgba[adr:adr + num] = [0.9, 0.2, 0.2, 1.0]
                     else:
                         model.geom_rgba[adr:adr + num] = policy._jaw_rgba
-                extra = f" (carrying {policy.grasped[0]})" if policy.grasped else ""
-                if state == 'CLOSED' and not policy.grasped:
-                    # aim hint: distance from beak to nearest sock
-                    mid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
-                    dists = [(np.linalg.norm((data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)] - data.xpos[mid])[:2]), n)
-                             for n in ("sock_red", "sock_blue", "sock_green", "sock_yellow")
-                             if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) >= 0]
-                    extra = (f" — nothing grabbed; nearest sock {min(dists)[1]} at {min(dists)[0]:.2f} m (need < 0.15)"
-                             if dists else " — no socks found in scene")
-                print(f"Jaw: {state}{extra}")
+                print(f"Jaw: {state}")
             elif key == "g":
                 policy.trigger_ground_pick()
             elif key == "k":
@@ -1319,7 +1269,7 @@ def main():
         print("  W / S or UP/DOWN: forward / brake   (hold-to-move: stops when released)")
         print("  A / E or D:       arc-turn left / right   (hold-to-move)")
         print("  LEFT/RIGHT arrow: strafe left/right (lin_vel_y)")
-        print("  M:                jaw close/open — close near a sock to grab, open to drop")
+        print("  M:                jaw close/open")
     print("  SPACE:            coast (zero all commands)")
     print("  T:                toggle policy inference on/off (paused = motors hold last target)")
     print("  G:                grab: crouch + jaw auto-closes at the bottom (M to release)")
@@ -1394,10 +1344,9 @@ def main():
                 prev_step_time = step_start
 
                 policy.update_ground_pick_phase(actual_dt)
-                policy.update_grasp()
 
-                # G = full grab: auto-close the jaw at the bottom of the crouch
-                # (it stays closed after — carry away; M releases).
+                # G = ground pick + auto jaw-close at the bottom of the crouch
+                # (it stays closed after; M reopens).
                 if (policy.ground_pick_mode and 0.15 < policy.ground_pick_phase < 0.5
                         and policy.jaw_frac > 0.5):
                     policy.jaw_frac = 0.0
