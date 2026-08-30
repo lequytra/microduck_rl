@@ -1,0 +1,43 @@
+<mujoco model="scene_socks">
+    <!-- scene.xml + socks scattered in front of the duck.
+         v2: smaller (3 cm radius), heavier (90 g), high-friction so the duck
+         can't punt them across the room; grasping is done by the magnetic-beak
+         sidecar in infer_policy.py (update_grasp). -->
+    <include file="scene.xml" />
+
+    <worldbody>
+        <body name="sock_red" pos="0.32 0.08 0.016">
+            <freejoint name="sock_red_free"/>
+            <geom name="sock_red_geom" type="capsule" size="0.014 0.032" mass="0.09"
+                  rgba="0.85 0.25 0.25 1" contype="1" conaffinity="1"
+                  friction="1.4 0.02 0.002" solref="0.02 1"/>
+        </body>
+        <body name="sock_blue" pos="0.55 -0.16 0.016" euler="0 0 0.7">
+            <freejoint name="sock_blue_free"/>
+            <geom name="sock_blue_geom" type="capsule" size="0.014 0.032" mass="0.09"
+                  rgba="0.25 0.45 0.85 1" contype="1" conaffinity="1"
+                  friction="1.4 0.02 0.002" solref="0.02 1"/>
+        </body>
+        <body name="sock_green" pos="0.78 0.06 0.016" euler="0 0 -0.5">
+            <freejoint name="sock_green_free"/>
+            <geom name="sock_green_geom" type="capsule" size="0.014 0.032" mass="0.09"
+                  rgba="0.3 0.7 0.35 1" contype="1" conaffinity="1"
+                  friction="1.4 0.02 0.002" solref="0.02 1"/>
+        </body>
+        <body name="sock_yellow" pos="0.42 0.26 0.016" euler="0 0 1.9">
+            <freejoint name="sock_yellow_free"/>
+            <geom name="sock_yellow_geom" type="capsule" size="0.014 0.032" mass="0.09"
+                  rgba="0.9 0.8 0.25 1" contype="1" conaffinity="1"
+                  friction="1.4 0.02 0.002" solref="0.02 1"/>
+        </body>
+        <!-- The laundry basket: static, walled, so placed socks stay placed. -->
+        <body name="basket" pos="0.30 -0.55 0">
+            <geom name="basket_floor" type="box" size="0.14 0.14 0.005" pos="0 0 0.005"
+                  rgba="0.55 0.38 0.2 1" friction="1.4 0.02 0.002"/>
+            <geom type="box" size="0.14 0.006 0.05" pos="0 0.14 0.055" rgba="0.55 0.38 0.2 0.9"/>
+            <geom type="box" size="0.14 0.006 0.05" pos="0 -0.14 0.055" rgba="0.55 0.38 0.2 0.9"/>
+            <geom type="box" size="0.006 0.14 0.05" pos="0.14 0 0.055" rgba="0.55 0.38 0.2 0.9"/>
+            <geom type="box" size="0.006 0.14 0.05" pos="-0.14 0 0.055" rgba="0.55 0.38 0.2 0.9"/>
+        </body>
+    </worldbody>
+</mujoco>

@@ -18,7 +18,7 @@ import mujoco
 import mujoco.viewer
 import onnxruntime as ort
 
-MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
+MICRODUCK_XML = os.environ.get("DUCK_SCENE", "src/mjlab_microduck/robot/microduck/scene.xml")
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_floor_objects.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_robot_walk.xml"
@@ -146,6 +146,11 @@ class PolicyInference:
         self.delay_min_lag = delay_min_lag
         self.delay_max_lag = delay_max_lag
         self.switch_threshold = switch_threshold
+        # Manual jaw (the human is the jaw policy until PPO unfreezes the
+        # grafted channel): 'm' toggles open/closed; closing near a sock grabs
+        # it (magnetic beak), opening releases.
+        self.jaw_frac = 1.0        # 1 = open, 0 = closed
+        self.grasped = None        # (name, qpos_adr, dof_adr, geom_id)
         # When True: emit the unified 13D command vector and treat head_offset /
         # body_cmd as policy COMMANDS (no add to ctrl, no joint_pos correction).
         # When False: legacy behaviour (3D command, head_offset added to ctrl[5:9]).
@@ -306,21 +311,31 @@ class PolicyInference:
         # For robots with passive/interspersed joints (e.g. roller skates), the actuated
         # joints are not contiguous in qpos/qvel. Compute the correct indices from the
         # actuator transmission joint IDs so extraction works for any joint ordering.
+        # Jaw-variant models (robot_*_jaw.xml) carry a 15th actuator (the jaw hinge,
+        # appended LAST): policy joints are actuators 0..13; the jaw is observed
+        # separately (v2 obs dim 61) and driven by the jaw_frac intent.
+        self.n_body = min(model.nu, 14)
         self.joint_qpos_indices = [
-            int(model.jnt_qposadr[model.actuator_trnid[i, 0]]) for i in range(model.nu)
+            int(model.jnt_qposadr[model.actuator_trnid[i, 0]]) for i in range(self.n_body)
         ]
         self.joint_qvel_indices = [
-            int(model.jnt_dofadr[model.actuator_trnid[i, 0]]) for i in range(model.nu)
+            int(model.jnt_dofadr[model.actuator_trnid[i, 0]]) for i in range(self.n_body)
         ]
+        self.jaw_qpos_idx = (int(model.jnt_qposadr[model.actuator_trnid[14, 0]])
+                             if model.nu > 14 else None)
 
-        # Default pose for the policy (flexed legs)
-        self.default_pose = DEFAULT_POSE[:self.n_joints]
+        # Default pose for the policy (flexed legs); jaw-variant extra actuators
+        # default to 0 (jaw closed).
+        self.default_pose = DEFAULT_POSE[:self.n_body]
+        if self.n_joints > self.n_body:
+            self.default_pose = np.concatenate(
+                [self.default_pose, np.zeros(self.n_joints - self.n_body, np.float32)])
         print(f"Number of actuators: {self.n_joints}")
         print(f"Default pose: {self.default_pose}")
         print(f"Action scale: {self.action_scale}")
 
         # Last action (for observation history)
-        self.last_action = np.zeros(self.n_joints, dtype=np.float32)
+        self.last_action = np.zeros(14, dtype=np.float32)  # obs slot is always 14-D
 
         # Velocity command [lin_vel_x, lin_vel_y, ang_vel_z] — controls walking / policy switching
         self.vel_cmd = np.zeros(3, dtype=np.float32)
@@ -566,7 +581,7 @@ class PolicyInference:
     def get_joint_pos_relative(self):
         """Get joint positions relative to default pose."""
         current_pos = self.data.qpos[self.joint_qpos_indices].copy().astype(np.float32)
-        return current_pos - self.default_pose
+        return current_pos - self.default_pose[:self.n_body]
 
     def get_joint_vel(self):
         """Get joint velocities."""
@@ -647,6 +662,46 @@ class PolicyInference:
         self.command[0] = np.cos(2 * np.pi * self.ground_pick_phase)
         self.command[1] = np.sin(2 * np.pi * self.ground_pick_phase)
         self.command[2] = 0.0
+
+    def update_grasp(self):
+        """Magnetic beak, jaw-keyed: closing the jaw near a sock grabs it
+        (contacts off, rides under the jaw); opening releases it."""
+        mouth_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "jaw")
+        if mouth_id < 0:  # rigid-jaw models: measure from the head
+            mouth_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
+        if mouth_id < 0:
+            return
+        mouth = self.data.xpos[mouth_id]
+        if self.grasped is None:
+            if self.jaw_frac > 0.5:  # jaw open: nothing to do
+                return
+            for name in ("sock_red", "sock_blue", "sock_green", "sock_yellow"):
+                bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+                if bid < 0:
+                    continue
+                d = np.linalg.norm((self.data.xpos[bid] - mouth)[:2])
+                if d < 0.15:
+                    jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name + "_free")
+                    gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name + "_geom")
+                    self.grasped = (name, self.model.jnt_qposadr[jid],
+                                    self.model.jnt_dofadr[jid], gid)
+                    self.model.geom_contype[gid] = 0
+                    self.model.geom_conaffinity[gid] = 0
+                    print(f"GRASPED {name}")
+                    break
+        else:
+            name, qadr, dadr, gid = self.grasped
+            if self.jaw_frac > 0.5:  # jaw opened: release
+                self.data.qvel[dadr:dadr + 6] = 0.0
+                self.model.geom_contype[gid] = 1
+                self.model.geom_conaffinity[gid] = 1
+                print(f"RELEASED {name}")
+                self.grasped = None
+            else:
+                self.data.qpos[qadr:qadr + 3] = [mouth[0], mouth[1],
+                                                 max(mouth[2] - 0.03, 0.02)]
+                self.data.qpos[qadr + 3:qadr + 7] = [1, 0, 0, 0]
+                self.data.qvel[dadr:dadr + 6] = 0.0
 
     def trigger_behavior(self, name):
         """Start an episodic behavior (kick_left / kick_right / roulade).
@@ -776,17 +831,26 @@ class PolicyInference:
     def infer(self):
         """Run policy inference and return action."""
         obs = self.get_observations()
-        # v2-family policies (jaw graft) expect extra obs dims the sim doesn't
-        # have yet — pad with zeros (jaw angle 0, contact 0 = dormant channel).
+        # v2-family policies (jaw graft) expect extra obs dims: jaw angle and
+        # jaw contact. Fed from the real jaw hinge state when the model has
+        # one, else the manual jaw state (the grafted v1 weights ignore them
+        # either way — the channel is dormant until training).
         want = self.ort_session.get_inputs()[0].shape[1]
         if isinstance(want, int) and obs.shape[0] < want:
-            obs = np.concatenate([obs, np.zeros(want - obs.shape[0], dtype=obs.dtype)])
+            if self.jaw_qpos_idx is not None:
+                jaw_angle = -float(self.data.qpos[self.jaw_qpos_idx]) / 0.52  # 1 = open
+            else:
+                jaw_angle = self.jaw_frac
+            jaw_obs = np.array([jaw_angle, 1.0 if self.grasped else 0.0],
+                               dtype=obs.dtype)
+            pad = jaw_obs[:want - obs.shape[0]]
+            obs = np.concatenate([obs, pad])
         obs_batch = obs.reshape(1, -1)
         action = self.ort_session.run([self.output_name], {self.input_name: obs_batch})[0]
         action = action.squeeze(0).astype(np.float32)
         # The obs contract's last-action slot is 14-D — store the body slice,
         # not the full v2 action vector, or next tick's obs is misaligned.
-        self.last_action = action[:self.n_joints].copy()
+        self.last_action = action[:self.n_body].copy()
         return action
 
     def apply_action(self, action):
@@ -796,10 +860,17 @@ class PolicyInference:
             delayed_index = (self.buffer_index - self.current_lag) % len(self.action_buffer)
             delayed_action = self.action_buffer[delayed_index]
             self.buffer_index = (self.buffer_index + 1) % len(self.action_buffer)
-            target_positions = self.default_pose + delayed_action[:self.n_joints] * self.action_scale
+            act = delayed_action
         else:
-            target_positions = self.default_pose + action[:self.n_joints] * self.action_scale
+            act = action
 
+        # Body joints are driven by the policy (v1 emits 14, v2 emits 15 with a
+        # dormant jaw channel we ignore); the jaw hinge follows jaw_frac.
+        body = act[:self.n_body]
+        target_positions = self.default_pose.copy()
+        target_positions[:self.n_body] += body * self.action_scale
+        if self.jaw_qpos_idx is not None:
+            target_positions[-1] = -self.jaw_frac * 0.52  # 0 = closed, -0.52 rad = open
         self.data.ctrl[:] = target_positions
         # Legacy mode: head_offset is an external perturbation added on top of
         # the policy output. New mode: head_offset is a COMMAND fed into the
@@ -1128,12 +1199,55 @@ def main():
                     print("Body pose cmd reset to zero")
                 else:
                     policy.set_vel_cmd(0.0, 0.0, 0.0)
+            elif key == "w":
+                if not policy.head_mode and not policy.body_pose_mode:
+                    policy.set_vel_cmd(policy.vel_max_x, policy.vel_cmd[1], policy.vel_cmd[2])
+            elif key == "s" and not policy.head_mode and not policy.body_pose_mode:
+                policy.set_vel_cmd(policy.vel_min_x, policy.vel_cmd[1], policy.vel_cmd[2])
+            elif key == "d":
+                if not policy.head_mode and not policy.body_pose_mode:
+                    policy.set_vel_cmd(0.25, 0.0, -0.8)  # arc CW (alias of E)
             elif key == "t":
                 # Toggle policy inference on/off. When OFF the controller stops
                 # querying the ONNX policy and the motors hold the last applied
                 # target (no fresh ctrl writes).
                 policy_enabled = not policy_enabled
                 print(f"Policy inference: {'ON' if policy_enabled else 'OFF (paused)'}")
+            elif key == ",":
+                # Arc-walk CCW: the alpha gait doesn't track turn-in-place or
+                # sidestep commands, so steer by walking forward with yaw.
+                policy.set_vel_cmd(0.25, 0.0, 0.8)
+                print("Vel cmd: [0.25, 0.00, +0.80] [arc CCW]")
+            elif key == ".":
+                policy.set_vel_cmd(0.25, 0.0, -0.8)
+                print("Vel cmd: [0.25, 0.00, -0.80] [arc CW]")
+            elif key == "m":
+                # Manual jaw: you are the jaw policy. Close near a sock to
+                # grab it; open to release. (The grafted v2 net's jaw channel
+                # is dormant — this is intent-driven, like the real robot.)
+                policy.jaw_frac = 0.0 if policy.jaw_frac > 0.5 else 1.0
+                state = 'OPEN' if policy.jaw_frac > 0.5 else 'CLOSED'
+                # Visual feedback: the beak geoms tint red while closed
+                # (the sim jaw has no joint, so this is the visible "bite").
+                bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
+                if bid >= 0:
+                    adr, num = model.body_geomadr[bid], model.body_geomnum[bid]
+                    if not hasattr(policy, "_jaw_rgba"):
+                        policy._jaw_rgba = model.geom_rgba[adr:adr + num].copy()
+                    if state == 'CLOSED':
+                        model.geom_rgba[adr:adr + num] = [0.9, 0.2, 0.2, 1.0]
+                    else:
+                        model.geom_rgba[adr:adr + num] = policy._jaw_rgba
+                extra = f" (carrying {policy.grasped[0]})" if policy.grasped else ""
+                if state == 'CLOSED' and not policy.grasped:
+                    # aim hint: distance from beak to nearest sock
+                    mid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "jaw_soft")
+                    dists = [(np.linalg.norm((data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)] - data.xpos[mid])[:2]), n)
+                             for n in ("sock_red", "sock_blue", "sock_green", "sock_yellow")
+                             if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) >= 0]
+                    extra = (f" — nothing grabbed; nearest sock {min(dists)[1]} at {min(dists)[0]:.2f} m (need < 0.15)"
+                             if dists else " — no socks found in scene")
+                print(f"Jaw: {state}{extra}")
             elif key == "g":
                 policy.trigger_ground_pick()
             elif key == "k":
@@ -1165,7 +1279,8 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("roll", policy.body_cmd_step_angle)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], policy.vel_max_ang)
+                    # Arc-walk CCW (turn-in-place is untrained in this checkpoint)
+                    policy.set_vel_cmd(0.25, 0.0, 0.8)
             elif key == "e":
                 if policy.head_mode:
                     policy.head_offset[3] = np.clip(policy.head_offset[3] - policy.head_step, -policy.head_max, policy.head_max)
@@ -1174,7 +1289,8 @@ def main():
                 elif policy.body_pose_mode:
                     policy.bump_body("roll", -policy.body_cmd_step_angle)
                 else:
-                    policy.set_vel_cmd(policy.vel_cmd[0], policy.vel_cmd[1], -policy.vel_max_ang)
+                    # Arc-walk CW
+                    policy.set_vel_cmd(0.25, 0.0, -0.8)
             elif key == "z":
                 if policy.head_mode:
                     policy.head_offset[0] = np.clip(policy.head_offset[0] + policy.head_step, -policy.head_max, policy.head_max)
@@ -1200,11 +1316,13 @@ def main():
         print("  LEFT/RIGHT arrow: turn left/right (ang_vel_z heading error)")
         print("  A / E:            turn left/right (ang_vel_z, incremental)")
     else:
+        print("  W / S or UP/DOWN: forward / brake   (hold-to-move: stops when released)")
+        print("  A / E or D:       arc-turn left / right   (hold-to-move)")
         print("  LEFT/RIGHT arrow: strafe left/right (lin_vel_y)")
-        print("  A / E:            turn left/right (ang_vel_z)")
+        print("  M:                jaw close/open — close near a sock to grab, open to drop")
     print("  SPACE:            coast (zero all commands)")
     print("  T:                toggle policy inference on/off (paused = motors hold last target)")
-    print("  G:                trigger ground pick (requires --ground-pick)")
+    print("  G:                grab: crouch + jaw auto-closes at the bottom (M to release)")
     print("  Y:                toggle sit (with --sit/--sitstand) or slope mode (with --slope)")
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
@@ -1240,12 +1358,26 @@ def main():
 
         try:
             prev_step_time = time.time()
+            last_drive_t = [time.time()]  # hold-to-move emulation (no key-up in terminals)
+            DRIVE_KEYS = {"up", "down", "left", "right", "w", "s", "a", "e", "d", ",", "."}
 
             while viewer.is_running() and not quit_requested:
                 step_start = time.time()
 
                 for key in term.get_keys():
+                    if key in DRIVE_KEYS:
+                        last_drive_t[0] = time.time()
                     handle_key(key)
+
+                # Hold-to-move: a drive keypress sets velocity; OS key-repeat
+                # keeps it alive; silence = released = stop. The threshold must
+                # bridge slow drain cycles (each 50 Hz tick costs ~20 ms of
+                # wall time, so keyless stretches accumulate fast) — 1.0 s.
+                if (np.linalg.norm(policy.vel_cmd) > 0
+                        and not policy.ground_pick_mode and not policy.sit_mode
+                        and policy.behavior_mode is None
+                        and time.time() - last_drive_t[0] > 1.0):
+                    policy.set_vel_cmd(0.0, 0.0, 0.0)
 
                 if not policy_enabled and policy_enable_time is not None:
                     if step_start >= policy_enable_time:
@@ -1262,6 +1394,14 @@ def main():
                 prev_step_time = step_start
 
                 policy.update_ground_pick_phase(actual_dt)
+                policy.update_grasp()
+
+                # G = full grab: auto-close the jaw at the bottom of the crouch
+                # (it stays closed after — carry away; M releases).
+                if (policy.ground_pick_mode and 0.15 < policy.ground_pick_phase < 0.5
+                        and policy.jaw_frac > 0.5):
+                    policy.jaw_frac = 0.0
+                    print("Jaw: CLOSED (auto-grab)")
                 policy.update_behavior(actual_dt)
 
                 if policy_enabled:
