@@ -8,6 +8,13 @@ the real robot. Sim2real transfer
 is the whole point: every convention below exists because breaking it produced a
 policy that worked in the viewer and failed on hardware.
 
+## PR workflow (repo rule)
+
+Open PRs against the **fork** `lequytra/microduck_rl` (base: `develop`) first —
+never directly against `pollen-robotics/microduck_rl`. `main` on the fork is
+branch-protected: changes land via PR only, no direct pushes. Upstream PRs
+happen only when the user explicitly asks.
+
 ## Commands
 
 ```bash
