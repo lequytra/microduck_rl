@@ -3178,6 +3178,11 @@ def _jaw_current_info(env: ManagerBasedRlEnv, asset: Entity) -> tuple[int, float
         kt = 0.36601349688984386
     info = (col, kt)
     cache[key] = info
+    # One-time wiring evidence at startup: which actuator_force column feeds
+    # obs[62] and which kt converts it. (Resolved by NAME — on the jaw model
+    # the jaw joint is mid-tree but its actuator is appended last.)
+    print(f"[jaw_current_obs] jaw actuator_force column={col}, kt={kt:.4f} "
+          f"(obs[62] = |torque|/kt, magnitude-only like runtime currents_ma)")
     return info
 
 
@@ -3211,7 +3216,15 @@ def jaw_current_obs(
     asset = env.scene[asset_cfg.name]
     col, kt = _jaw_current_info(env, asset)
     torque = asset.data.actuator_force[:, col]  # (num_envs,)
-    return (torque.abs() / kt).unsqueeze(-1)
+    current = torque.abs() / kt
+
+    # Telemetry: proves the bite signal is alive in wandb (spikes when the jaw
+    # works against something, ~friction baseline when it moves through air).
+    log = env.extras.setdefault("log", {})
+    log["Metrics/jaw_current_a_mean"] = current.mean()
+    log["Metrics/jaw_current_a_max"] = current.max()
+
+    return current.unsqueeze(-1)
 
 
 def jaw_aperture_phased_reward(
@@ -3259,6 +3272,14 @@ def jaw_aperture_phased_reward(
     target = torch.where(releasing, open_frac, target)
 
     err = jaw_frac - target
+
+    # Telemetry: the jaw-learning curves in wandb. jaw_aperture_mean should
+    # converge to jaw_target_mean as training progresses; tracking_err → 0.
+    log = env.extras.setdefault("log", {})
+    log["Metrics/jaw_aperture_mean"] = jaw_frac.mean()
+    log["Metrics/jaw_target_mean"] = target.mean()
+    log["Metrics/jaw_tracking_err_mean"] = err.abs().mean()
+
     return torch.exp(-((err / std) ** 2))
 
 
