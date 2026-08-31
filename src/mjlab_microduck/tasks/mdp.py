@@ -3020,6 +3020,29 @@ def mouth_perpendicular_phased(
     return gate * alignment
 
 
+def _servo_view_keep(
+    env: ManagerBasedRlEnv, asset: Entity, exclude_names: tuple
+) -> list:
+    """Indices into the servo joint view (``^(?!passive_).*``) that DROP the
+    named joints — resolved by name, cached per asset.
+
+    On the jaw model the ``jaw`` joint sits mid-tree (servo-view position 9),
+    so legacy hardcoded ``joint_indices`` like ``[0..4, 9..13]`` (left leg +
+    right leg on the 14-servo models) would silently include the jaw and drop
+    the right ankle. Excluding by name keeps the v1 meaning of those indices
+    on 15-servo models.
+    """
+    cache = env.__dict__.setdefault("_servo_view_keep_cache", {})
+    key = (id(asset), exclude_names)
+    keep = cache.get(key)
+    if keep is None:
+        _, names = asset.find_joints(r"^(?!passive_).*")
+        keep = [i for i, n in enumerate(names)
+                if n.split("/")[-1] not in exclude_names]
+        cache[key] = keep
+    return keep
+
+
 def ground_pick_return_pose_phased(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -3028,11 +3051,21 @@ def ground_pick_return_pose_phased(
     joint_indices: Optional[list] = None,
     hold_end: float = 0.35,
     rise_end: float = 0.60,
+    servo_exclude_names: tuple = (),
 ) -> torch.Tensor:
-    """ground_pick_return_pose gaté par la up-gate segmentée (remontée+repos)."""
+    """ground_pick_return_pose gaté par la up-gate segmentée (remontée+repos).
+
+    ``servo_exclude_names``: drop these joints from the servo view BEFORE
+    applying ``joint_indices``, so indices keep their v1 (14-servo) meaning on
+    models with extra actuated joints (the jaw model: pass ``("jaw",)``).
+    """
     asset = env.scene[asset_cfg.name]
     joint_pos = _servo_joint_pos(env, asset)
     default_pos = _servo_default_joint_pos(env, asset)
+    if servo_exclude_names:
+        keep = _servo_view_keep(env, asset, servo_exclude_names)
+        joint_pos = joint_pos[:, keep]
+        default_pos = default_pos[:, keep]
     if joint_indices is not None:
         joint_pos = joint_pos[:, joint_indices]
         default_pos = default_pos[:, joint_indices]

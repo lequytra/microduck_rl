@@ -72,6 +72,15 @@ def test_jaw_pick_reward_wired():
         assert r[name].weight < 0, name
 
 
+def test_jaw_pick_leg_reward_excludes_jaw():
+    """The mid-tree jaw joint shifts the servo view; legacy leg indices must
+    keep their v1 meaning via name-based exclusion (the silent jaw-as-hip bug).
+    """
+    cfg = make_microduck_jaw_pick_env_cfg()
+    legs = cfg.rewards["ground_pick_return_pose_legs"]
+    assert legs.params.get("servo_exclude_names") == ("jaw",)
+
+
 def test_jaw_pick_variants_build():
     assert "jaw_aperture" in make_microduck_jaw_pick_env_cfg(rough=True).rewards
     assert "jaw_aperture" in make_microduck_jaw_pick_env_cfg(play=True).rewards

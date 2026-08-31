@@ -27,11 +27,11 @@ closed.
 
 ── v2 policy skeleton ────────────────────────────────────────────────────────
 A v2 training checkpoint can be initialized by grafting the trained v1
-ground-pick actor with ``scripts/graft_v2_jaw.py`` (widen obs 61→63 with zero
-columns, dummy jaw action row) and passing the resulting actor state_dict as
-``--agent.graft_from <path.pt>``. The ``GraftOnPolicyRunner`` loads it before
-the first ``learn()`` step so PPO starts from the v1 behavior with the jaw
-channel dormant.
+ground-pick actor with ``scripts/graft_v2_actor.py`` (widen obs 61→63 with zero
+columns, dormant jaw action row; ``graft_v2_jaw.py`` does the same for ONNX)
+and passing the resulting actor state_dict as ``--agent.graft_from <path.pt>``.
+The ``GraftOnPolicyRunner`` loads it before the first ``learn()`` step so PPO
+starts from the v1 behavior with the jaw channel dormant.
 """
 
 from copy import deepcopy
@@ -173,6 +173,17 @@ def make_microduck_jaw_pick_env_cfg(play: bool = False, rough: bool = False) -> 
         },
     )
 
+    # ── 5. Fix inherited reward indexing on the 15-servo model ───────────────
+    # ground_pick_return_pose_legs slices the servo joint view with hardcoded
+    # v1 indices [0..4, 9..13]. On the jaw model the jaw joint is mid-tree
+    # (servo-view position 9), so those indices would reward driving the JAW to
+    # the right-hip home pose during the rise — directly fighting jaw_aperture —
+    # and drop the right ankle. Exclude the jaw by NAME so the legacy indices
+    # keep their v1 meaning over the 14 body servos. (Neck terms are unaffected:
+    # neck joints sit before the jaw at servo-view 5..8.)
+    legs = cfg.rewards["ground_pick_return_pose_legs"]
+    legs.params["servo_exclude_names"] = ("jaw",)
+
     return cfg
 
 
@@ -236,7 +247,7 @@ class MicroduckJawPickRlCfg(RslRlOnPolicyRunnerCfg):
 
     graft_from: str = ""
     """Path to a v2 ACTOR state_dict .pt (63-obs / 15-act). Empty = cold start.
-    Produced by scripts/graft_v2_jaw.py (widen v1 actor + zero-initialized jaw
+    Produced by scripts/graft_v2_actor.py (widen v1 actor + zero-initialized jaw
     channel). Loaded by GraftOnPolicyRunner before the first learn() step."""
 
 
