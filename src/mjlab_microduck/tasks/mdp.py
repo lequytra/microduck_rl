@@ -3138,6 +3138,130 @@ def apply_mouth_payload_force(
     return torch.zeros(env.num_envs, device=env.device)
 
 
+def _jaw_current_info(env: ManagerBasedRlEnv, asset: Entity) -> tuple[int, float]:
+    """(actuator_force column, kt) for the jaw servo, resolved once per asset.
+
+    ``asset.data.actuator_force`` is indexed in ACTUATOR order (unlike qpos,
+    which is joint order), and the actuator order drifts from the joint order on
+    the jaw model — the ``jaw`` joint sits mid-tree but its XML actuator is
+    appended LAST. So the column is resolved from the entity's spec actuators
+    (``asset.spec.actuators`` semantics: position in that tuple = column in
+    ``actuator_force``, via ``indexing.ctrl_ids``), not from the joint index.
+    The torque constant kt is read off the BAM motor model that drives the jaw
+    (``_bam_model.kt.value``, ``bam/params/xl330/m6.json``) when available;
+    otherwise falls back to the constant. Resolution is once per asset (cached
+    on the env, mirroring ``_servo_joint_ids_cache``).
+    """
+    cache = env.__dict__.setdefault("_jaw_current_info_cache", {})
+    key = id(asset)
+    info = cache.get(key)
+    if info is not None:
+        return info
+    col = None
+    for i, spec_act in enumerate(asset.spec.actuators):
+        tgt = spec_act.target
+        tgt_name = getattr(tgt, "name", None) or (str(tgt) if tgt else None)
+        if tgt_name is not None and tgt_name.split("/")[-1] == "jaw":
+            col = i
+            break
+    if col is None:
+        raise RuntimeError(f"No actuator targets joint 'jaw' on '{asset.name}'")
+    kt = None
+    for actuator in asset.actuators:
+        if "jaw" in actuator.target_names:
+            bam = getattr(actuator, "_bam_model", None)
+            if bam is not None:
+                kt = float(bam.kt.value)
+            break
+    if kt is None:
+        # xl330 M6 torque constant (N·m/A), from bam/params/xl330/m6.json.
+        kt = 0.36601349688984386
+    info = (col, kt)
+    cache[key] = info
+    return info
+
+
+def jaw_angle_obs(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=("jaw",)),
+) -> torch.Tensor:
+    """Normalized jaw aperture observation: ``-qpos_jaw / 0.52``.
+
+    The jaw hinge runs [−0.52, 0.09] rad with 0 = closed and −0.52 = open, so
+    the normalized aperture is 1 = open, 0 = closed. Matches the
+    ``scripts/infer_policy.py`` / robot-runtime convention. Shape (num_envs, 1).
+    """
+    asset = env.scene[asset_cfg.name]
+    q = asset.data.joint_pos[:, asset_cfg.joint_ids]  # (num_envs, 1)
+    return -q / 0.52
+
+
+def jaw_current_obs(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=("jaw",)),
+) -> torch.Tensor:
+    """UNSIGNED jaw servo current proxy (A): ``|actuator_torque| / kt``.
+
+    The runtime records ``currents_ma`` magnitude-only (sign dropped), so the
+    observation must be magnitude-only too. The drive torque is read from
+    ``asset.data.actuator_force`` (ACTUATOR order — the jaw column is resolved
+    and cached by ``_jaw_current_info``); kt is the xl330 M6 torque constant.
+    Shape (num_envs, 1).
+    """
+    asset = env.scene[asset_cfg.name]
+    col, kt = _jaw_current_info(env, asset)
+    torque = asset.data.actuator_force[:, col]  # (num_envs,)
+    return (torque.abs() / kt).unsqueeze(-1)
+
+
+def jaw_aperture_phased_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.15,
+    descent_end: float = 0.375,
+    hold_end: float = 0.425,
+    rise_end: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=("jaw",)),
+) -> torch.Tensor:
+    """Gaussian tracking reward for the jaw aperture vs a phase-scheduled target.
+
+    jaw_frac = ``-qpos_jaw / 0.52`` (1 = mouth open, 0 = closed), computed from
+    the same normalization as ``jaw_angle_obs``. Phase from ``_gp_phase``.
+    Target aperture profile over the ground-pick phase:
+
+      [0, descent_end)              : 1.0          (open during the descent)
+      [descent_end, hold_end)       : 1.0 -> 0.0   (close across the hold)
+      [hold_end, rise_end)          : 0.0          (carry closed through the rise)
+      [rise_end, rise_end + 0.05)   : 0.0 -> 1.0   (release / reopen)
+      [rise_end + 0.05, 1.0)        : 1.0          (open)
+
+    Returns ``exp(-(err/std)²)`` ∈ (0, 1] with err = jaw_frac − target. Use a
+    POSITIVE weight in the reward cfg.
+    """
+    asset = env.scene[asset_cfg.name]
+    phase = _gp_phase(env, command_name)  # (num_envs,)
+    jaw_frac = -asset.data.joint_pos[:, asset_cfg.joint_ids].squeeze(-1) / 0.52
+
+    release_window = 0.05
+    release_end = rise_end + release_window
+
+    target = torch.ones_like(phase)
+    # Close across the hold window: 1.0 -> 0.0.
+    closing = (phase >= descent_end) & (phase < hold_end)
+    close_frac = 1.0 - (phase - descent_end) / max(hold_end - descent_end, 1e-6)
+    target = torch.where(closing, close_frac, target)
+    # Carry closed through the rise.
+    carrying = (phase >= hold_end) & (phase < rise_end)
+    target = torch.where(carrying, torch.zeros_like(phase), target)
+    # Release / reopen: 0.0 -> 1.0 over release_window of phase.
+    releasing = (phase >= rise_end) & (phase < release_end)
+    open_frac = (phase - rise_end) / max(release_end - rise_end, 1e-6)
+    target = torch.where(releasing, open_frac, target)
+
+    err = jaw_frac - target
+    return torch.exp(-((err / std) ** 2))
+
+
 # ==============================================================================
 # Domain Randomization Events
 # ==============================================================================
