@@ -1,0 +1,15 @@
+<mujoco model="microduck_objects">
+    <compiler angle="radian" autolimits="true"/>
+
+    <!-- All three grabbable props in one model, for the standalone CPU tooling
+         (scripts/render_pov.py, scripts/measure_v2_reach.py).
+
+         The RL env does NOT use this file: mjlab needs one entity per free
+         body so that write_root_link_pose_to_sim addresses a single root, so
+         it loads object_block.xml / object_rubber_ball.xml / object_sock.xml
+         as three separate entities. Each prop is therefore defined exactly
+         once, in its own file, and this aggregate just includes them. -->
+    <include file="object_block.xml"/>
+    <include file="object_rubber_ball.xml"/>
+    <include file="object_sock.xml"/>
+</mujoco>

@@ -7186,3 +7186,770 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ===========================================================================
+# GoToPoint (v2 targeted walk): drive to a commanded pose on the floor.
+#
+# The runtime pipeline is  detector bbox -> (dx, dy) -> walk there, so the
+# policy's twist slot carries a GOAL OFFSET, not a velocity. The awkward part
+# is that all of the gait quality in this repo (air_time, foot_clearance,
+# foot_slip, and above all track_linear_velocity / track_angular_velocity)
+# is written against a velocity command, and rewriting it against a position
+# goal would throw the tuning away.
+#
+# So the command term keeps BOTH: `vel_command_b` stays a genuine velocity
+# setpoint, derived from the goal error and capped to the ranges the gait was
+# tuned for, and every stock reward keeps working untouched. The goal error
+# lives in `goal_error_b` and reaches the policy through
+# `goal_position_command` below. Slowing down near the goal then falls out of
+# the setpoint for free, and because the setpoint decays to zero inside the
+# arrival radius, overshooting the goal pays nothing.
+# ===========================================================================
+
+
+class RelativeGoalPositionCommand(VelocityCommandCommandOnly):
+    """Go-to-pose command: observation is the goal error, reward is a velocity.
+
+    Observed (via :func:`goal_position_command`)::
+
+        goal_error_b = [dx_body, dy_body, yaw_error]
+
+    ``dx``/``dy`` are the goal position in the robot's body frame (metres, so
+    +x is "ahead of me") and ``yaw_error`` is the wrapped difference between
+    the commanded goal heading and the robot's heading.
+
+    Why a goal *pose* and not a bearing: bearing is ill-conditioned as the
+    distance goes to zero -- a millimetre of jitter at the goal swings it by
+    180 degrees -- so a policy trained on bearing spins on the spot once it
+    arrives. A commanded heading stays well-defined at zero distance, and it
+    is also the thing that actually matters downstream: arriving *facing* the
+    object is what puts it in the beak's reach envelope for the grab.
+
+    The steering setpoint therefore blends the two: far away it steers along
+    the bearing (get there), and inside the arrival radius it rotates to the
+    commanded heading (face the right way), with the blend keyed on distance.
+    """
+
+    cfg: "RelativeGoalPositionCommandCfg"
+
+    def __init__(self, cfg: "RelativeGoalPositionCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._goal_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
+        self._goal_yaw_w = torch.zeros(self.num_envs, device=self.device)
+        # What the policy sees: [dx_b, dy_b, yaw_error].
+        self.goal_error_b = torch.zeros(self.num_envs, 3, device=self.device)
+        # Distance to the goal, cached for the rewards and the progress term.
+        self.distance = torch.zeros(self.num_envs, device=self.device)
+
+        self.metrics["goal_distance"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["goal_yaw_error"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _heading_w(self) -> torch.Tensor:
+        return self.robot.data.heading_w
+
+    def _root_pose_from_qpos(
+        self, env_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Robot (xy, yaw) read straight out of qpos, for use during reset.
+
+        ``root_link_pos_w`` is a derived quantity that only refreshes on the
+        next ``sim.forward()``, which happens AFTER the command manager resets.
+        Sampling against it puts every fresh goal around the previous episode's
+        pose — and on the very first reset around the world origin, which with
+        a tiled terrain means several metres away, in a neighbouring env's
+        cell. qpos has already been written by ``reset_base`` at this point.
+        """
+        qpos = self._env.sim.data.qpos[env_ids][:, self.robot.indexing.free_joint_q_adr]
+        xy = qpos[:, :2]
+        qw, qx, qy, qz = qpos[:, 3], qpos[:, 4], qpos[:, 5], qpos[:, 6]
+        yaw = torch.atan2(
+            2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)
+        )
+        return xy, yaw
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        n = len(env_ids)
+        if n == 0:
+            return
+
+        # The goal is sampled RELATIVE to wherever the robot currently is, so
+        # this stays correct under per-env terrain origins.
+        origin, heading = self._root_pose_from_qpos(env_ids)
+
+        radius = torch.empty(n, device=self.device).uniform_(*self.cfg.goal_radius_range)
+        bearing = torch.empty(n, device=self.device).uniform_(-math.pi, math.pi)
+
+        r = torch.empty(n, device=self.device)
+        # Bucket 1 -- goal BEHIND the robot. Uniform bearing puts only a sliver
+        # of episodes in the rear sector, and turning around is a distinct
+        # skill (the same reason turn-in-place needed its own bucket in the
+        # velocity env). Force a share of episodes into the rear cone.
+        behind = r.uniform_(0.0, 1.0) < self.cfg.rel_behind_envs
+        rear_sign = torch.where(
+            torch.empty(n, device=self.device).uniform_(0.0, 1.0) < 0.5, -1.0, 1.0
+        )
+        rear_bearing = rear_sign * torch.empty(n, device=self.device).uniform_(
+            self.cfg.behind_min_angle, math.pi
+        )
+        bearing = torch.where(behind, rear_bearing, bearing)
+
+        # Bucket 2 -- ALREADY at the goal, i.e. "you have arrived, stand still".
+        # Uniform radius sampling essentially never produces it, and it is the
+        # state the robot must hold before the grab policy takes over.
+        arrived = torch.empty(n, device=self.device).uniform_(0.0, 1.0) < self.cfg.rel_arrived_envs
+        radius = torch.where(
+            arrived,
+            torch.empty(n, device=self.device).uniform_(0.0, self.cfg.stop_radius),
+            radius,
+        )
+
+        goal_bearing_w = heading + bearing
+        self._goal_pos_w[env_ids, 0] = origin[:, 0] + radius * torch.cos(goal_bearing_w)
+        self._goal_pos_w[env_ids, 1] = origin[:, 1] + radius * torch.sin(goal_bearing_w)
+
+        # Commanded heading at the goal. For the already-arrived bucket keep it
+        # close to the current heading, so those episodes really do mean
+        # "stand still" rather than "spin on the spot".
+        yaw_offset = torch.empty(n, device=self.device).uniform_(*self.cfg.goal_yaw_range)
+        yaw_offset = torch.where(
+            arrived,
+            torch.empty(n, device=self.device).uniform_(-0.15, 0.15),
+            yaw_offset,
+        )
+        self._goal_yaw_w[env_ids] = wrap_to_pi(heading + yaw_offset)
+
+        # Never let the base class zero the command for "standing" envs: here
+        # standing is a CONSEQUENCE of being at the goal, and it is the
+        # arrived bucket that trains it.
+        self.is_standing_env[env_ids] = False
+
+    def _update_command(self) -> None:
+        # Deliberately NOT calling super(): the base runs a heading controller
+        # and the standing/world-frame masks over vel_command_b, all of which
+        # would fight the setpoint computed here.
+        pos = self.robot.data.root_link_pos_w[:, :2]
+        heading = self._heading_w()
+
+        delta_w = self._goal_pos_w - pos
+        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
+        dx_b = cos_h * delta_w[:, 0] + sin_h * delta_w[:, 1]
+        dy_b = -sin_h * delta_w[:, 0] + cos_h * delta_w[:, 1]
+        distance = torch.sqrt(dx_b * dx_b + dy_b * dy_b + 1e-12)
+        yaw_error = wrap_to_pi(self._goal_yaw_w - heading)
+
+        self.distance = distance
+        clip = self.cfg.obs_clip_m
+        self.goal_error_b[:, 0] = dx_b.clamp(-clip, clip)
+        self.goal_error_b[:, 1] = dy_b.clamp(-clip, clip)
+        self.goal_error_b[:, 2] = yaw_error
+
+        # --- linear setpoint -------------------------------------------------
+        # Proportional in distance and capped, so it tapers to zero as the
+        # robot closes in: being early at the goal buys nothing, and there is
+        # no jackpot for sprinting in and stopping dead.
+        speed = torch.clamp(self.cfg.approach_gain * distance, max=self.cfg.max_speed)
+        speed = torch.where(distance < self.cfg.stop_radius, torch.zeros_like(speed), speed)
+        scale = speed / distance.clamp(min=1e-6)
+        lin_x = dx_b * scale
+        lin_y = dy_b * scale
+
+        # --- angular setpoint ------------------------------------------------
+        # Far: steer along the bearing. Near: rotate to the commanded heading.
+        bearing = torch.atan2(dy_b, dx_b)
+        blend = (distance / self.cfg.arrival_radius).clamp(0.0, 1.0)
+        ang_error = blend * bearing + (1.0 - blend) * yaw_error
+        ang_z = self.cfg.turn_gain * ang_error
+
+        # Clamp into the ranges the gait rewards were tuned against, so the
+        # setpoint never asks for a velocity the walking policy never saw.
+        lo_x, hi_x = self.cfg.ranges.lin_vel_x
+        lo_y, hi_y = self.cfg.ranges.lin_vel_y
+        lo_z, hi_z = self.cfg.ranges.ang_vel_z
+        self.vel_command_b[:, 0] = lin_x.clamp(lo_x, hi_x)
+        self.vel_command_b[:, 1] = lin_y.clamp(lo_y, hi_y)
+        self.vel_command_b[:, 2] = ang_z.clamp(lo_z, hi_z)
+        self.vel_command_w[:] = self.vel_command_b
+
+    def _update_metrics(self) -> None:
+        self.metrics["goal_distance"] = self.distance
+        self.metrics["goal_yaw_error"] = self.goal_error_b[:, 2].abs()
+
+
+@_dataclass(kw_only=True)
+class RelativeGoalPositionCommandCfg(VelocityCommandCommandOnlyCfg):
+    goal_radius_range: tuple[float, float] = (0.25, 1.20)
+    """How far away the goal is sampled, in metres."""
+    goal_yaw_range: tuple[float, float] = (-math.pi, math.pi)
+    """Commanded heading at the goal, relative to the heading at reset."""
+    arrival_radius: float = 0.20
+    """Inside this radius the steering switches from bearing to goal heading,
+    and `goal_arrival_composite` starts paying."""
+    stop_radius: float = 0.05
+    """Inside this radius the velocity setpoint is exactly zero: arrived."""
+    approach_gain: float = 1.2
+    """Setpoint speed per metre of remaining distance (capped by max_speed)."""
+    max_speed: float = 0.35
+    turn_gain: float = 1.5
+    obs_clip_m: float = 2.0
+    """Clip on the observed offset. Keeps a far-away goal from saturating the
+    observation normalizer."""
+    rel_arrived_envs: float = 0.10
+    """Share of episodes that START at the goal (train "arrived, stand still")."""
+    rel_behind_envs: float = 0.20
+    """Share of episodes whose goal is in the rear cone (train turning around)."""
+    behind_min_angle: float = 2.0
+    """Rear cone half-angle, rad (2.0 ~ 115 deg off the nose)."""
+
+    def build(self, env: ManagerBasedRlEnv) -> "RelativeGoalPositionCommand":
+        return RelativeGoalPositionCommand(self, env)
+
+
+def goal_position_command(
+    env: ManagerBasedRlEnv, command_name: str = "twist"
+) -> torch.Tensor:
+    """Observation for the twist slot: [dx_body, dy_body, yaw_error].
+
+    Replaces `generated_commands` on the twist slot. The command term's
+    `vel_command_b` (what `generated_commands` would return) is the internal
+    velocity setpoint the gait rewards track — showing the policy that instead
+    would hand it the answer and it would never learn to close the loop itself.
+    """
+    term = env.command_manager.get_term(command_name)
+    return term.goal_error_b
+
+
+def _goal_term(env: ManagerBasedRlEnv, command_name: str) -> "RelativeGoalPositionCommand":
+    return env.command_manager.get_term(command_name)  # type: ignore[return-value]
+
+
+def goal_progress(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    max_paid_rate: float = 0.4,
+) -> torch.Tensor:
+    """Potential-based reward on closing the distance to the goal.
+
+    Pays Δ(−distance) per second, capped at ``max_paid_rate`` m/s of paid
+    closure. Approaching pays, holding station pays exactly zero, and backing
+    off costs — so there is nothing to farm by orbiting the goal or by
+    bouncing in and out of it, which a distance-level reward invites.
+
+    The rate cap matters for the same reason it does in `roulade_progress`:
+    without it, charging the goal collects the whole potential in a couple of
+    steps and the cheapest route to the reward is maximum violence.
+    """
+    term = _goal_term(env, command_name)
+    distance = torch.nan_to_num(term.distance, nan=0.0)
+    previous = getattr(env, "_goto_prev_distance", None)
+    if previous is None or previous.shape != distance.shape:
+        previous = distance.clone()
+    delta = previous - distance
+    # Fresh episodes teleport the goal; that jump is not progress.
+    reset_mask = env.episode_length_buf <= 1
+    delta = torch.where(reset_mask, torch.zeros_like(delta), delta)
+    delta = delta.clamp(-max_paid_rate * env.step_dt, max_paid_rate * env.step_dt)
+    env._goto_prev_distance = distance.clone()
+    return delta / env.step_dt
+
+
+def goal_arrival_composite(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    dist_std: float = 0.08,
+    yaw_std: float = 0.35,
+    still_std: float = 0.15,
+    upright_std: float = 0.25,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Product of Gaussians on distance, heading, stillness and uprightness.
+
+    A SUM of these four would have a comfortable compromise basin: 80% of
+    every term by drifting through the goal at a slight angle, still moving.
+    A product collapses on any single deficient factor, so the only way to
+    score is to be at the goal, facing the commanded way, stopped, and level —
+    which is exactly the hand-off state the grab policy needs.
+
+    The stds are deliberately loose enough that a mediocre current policy
+    still scores visibly; a product of four tight Gaussians reads zero
+    everywhere and gives no gradient at all.
+    """
+    term = _goal_term(env, command_name)
+    asset: Entity = env.scene[asset_cfg.name]
+
+    distance = torch.nan_to_num(term.distance, nan=10.0)
+    yaw_error = torch.nan_to_num(term.goal_error_b[:, 2], nan=math.pi)
+    speed = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, :2], nan=0.0).norm(dim=-1)
+    yaw_rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    # projected gravity xy = 0 when perfectly upright.
+    tilt = torch.nan_to_num(asset.data.projected_gravity_b[:, :2], nan=1.0).norm(dim=-1)
+
+    at_goal = torch.exp(-(distance / dist_std) ** 2)
+    facing = torch.exp(-(yaw_error / yaw_std) ** 2)
+    still = torch.exp(-((speed / still_std) ** 2 + (yaw_rate / (4.0 * still_std)) ** 2))
+    upright = torch.exp(-(tilt / upright_std) ** 2)
+    return at_goal * facing * still * upright
+
+
+def goal_overshoot_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    speed_ref: float = 0.15,
+) -> torch.Tensor:
+    """Self-negating penalty for carrying speed while sitting on the goal.
+
+    Returns ≤ 0, so it takes a POSITIVE weight (the self-negating convention
+    in this file — a negative weight here would double-negate into a reward
+    for barrelling through the goal, which is precisely the behaviour it is
+    meant to stop).
+
+    Only active inside the stop radius, where the velocity setpoint is already
+    zero; outside it, moving fast is the job.
+    """
+    term = _goal_term(env, command_name)
+    asset: Entity = env.scene["robot"]
+    inside = (torch.nan_to_num(term.distance, nan=10.0) < term.cfg.stop_radius).float()
+    speed = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, :2], nan=0.0).norm(dim=-1)
+    return -inside * (speed / speed_ref).clamp(max=3.0) ** 2
+
+
+def goal_command_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    stages: list[dict],
+) -> torch.Tensor:
+    """Stage the goal sampling: radius, and the two spawn buckets.
+
+    ``stages`` is a list of ``{"step": int, ...}`` where the remaining keys are
+    :class:`RelativeGoalPositionCommandCfg` fields to set. Latest passed stage
+    wins; this is a step function, not an interpolation, so ramps have to be
+    written out as stages.
+
+    Mutates the LIVE command term's cfg, never ``env.cfg.commands`` — the
+    CommandManager deep-copies its cfg at init, so writing to ``env.cfg`` is a
+    silent no-op.
+    """
+    del env_ids
+
+    term = env.command_manager.get_term(command_name)
+    assert term is not None, f"Command term '{command_name}' not found"
+
+    current = stages[0]
+    for stage in stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage
+    for key, value in current.items():
+        if key == "step":
+            continue
+        setattr(term.cfg, key, value)
+
+    return torch.tensor(float(current.get("goal_radius_range", (0.0, 0.0))[1]))
+
+
+# ===========================================================================
+# ObjectPick (v2 targeted grab): close a real jaw on a real object and lift it.
+#
+# With an actuated jaw and the beak collision geoms, "holding" stops being
+# something we have to model and becomes something the physics either does or
+# does not do. That removes the payload-force hack and the weld trick, and it
+# changes what the reward has to say: the reward never mentions the jaw at all.
+#
+# The one rule everything here follows: **closure is never paid directly.** A
+# reward on jaw angle, or on beak-object contact by itself, is farmed by
+# chomping on air or by pinning the object against the floor. Closing the jaw
+# only ever pays through the object leaving the ground and staying up.
+# ===========================================================================
+
+_PARKED_OFFSET = 0.55
+"""How far to the side the inactive props are parked, in metres.
+
+Two constraints squeeze this from both ends. Parking them BELOW the floor is
+the obvious idea and does not work: the terrain plane is infinite and
+one-sided, so a prop underneath it is penetrating it and gets shoved back up
+into the episode. And envs are TILED into one world at ``env_spacing`` (2.0m,
+so a cell half-width of 1.0m) rather than being independent worlds, so parking
+far away drops props into a neighbour's cell.
+
+0.55m sits well inside the cell and several times outside the reach of a robot
+that is never commanded to walk in this task. Even a park that did get nudged
+is harmless: contact and lift are both read through the ACTIVE prop index."""
+
+
+def _object_names(env: ManagerBasedRlEnv) -> tuple[str, ...]:
+    return tuple(getattr(env.cfg, "grab_object_names", ("block", "rubber_ball", "sock")))
+
+
+def _active_object_idx(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Which prop is live this episode, per env."""
+    idx = getattr(env, "_grab_active_idx", None)
+    if idx is None or idx.shape[0] != env.num_envs:
+        idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        env._grab_active_idx = idx
+    return idx
+
+
+def _active_object_pos_w(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """World position of each env's ACTIVE prop, (N, 3).
+
+    The scene holds all three props at once and parks the two that are not in
+    play, so every read has to be gathered through the active index — reading a
+    fixed entity would silently measure a parked object for two thirds of the
+    envs.
+    """
+    names = _object_names(env)
+    idx = _active_object_idx(env)
+    stacked = torch.stack(
+        [env.scene[name].data.root_link_pos_w for name in names], dim=1
+    )  # (N, n_objects, 3)
+    return torch.gather(stacked, 1, idx.view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)
+
+
+def _active_object_vel_w(env: ManagerBasedRlEnv) -> torch.Tensor:
+    names = _object_names(env)
+    idx = _active_object_idx(env)
+    stacked = torch.stack(
+        [env.scene[name].data.root_link_lin_vel_w for name in names], dim=1
+    )
+    return torch.gather(stacked, 1, idx.view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)
+
+
+def _grab_heights(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Resting top-surface height of each env's active prop, (N,)."""
+    from mjlab_microduck.robot.microduck_constants import GRAB_HEIGHTS
+
+    names = _object_names(env)
+    table = torch.tensor(
+        [GRAB_HEIGHTS[n] for n in names], device=env.device, dtype=torch.float
+    )
+    return table[_active_object_idx(env)]
+
+
+def _terrain_z(env: ManagerBasedRlEnv) -> torch.Tensor:
+    return env.scene.terrain.env_origins[:, 2]
+
+
+_JAW_TIP_CFG = SceneEntityCfg("robot", site_names=["jaw_tip"])
+
+
+def _beak_site_pos_w(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    site_ids = asset_cfg.site_ids
+    assert not isinstance(site_ids, slice), (
+        "asset_cfg site_names were never resolved. The managers only resolve a "
+        "SceneEntityCfg that appears in a term's params, so pass it explicitly "
+        "in the reward cfg rather than relying on the default argument."
+    )
+    return asset.data.site_pos_w[:, site_ids[0], :]
+
+
+def reset_grab_object(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    offset: tuple = (0.085, 0.0),
+    noise_xy: float = 0.02,
+    yaw_noise: float = math.pi,
+):
+    """Pick one prop per episode, place it in reach, park the other two.
+
+    ``offset`` is the nominal prop position in the robot's yaw frame. The
+    default 85mm forward comes from the measured reach envelope
+    (scripts/measure_v2_reach.py): every prop is reachable from a statically
+    stable crouch somewhere in the 60-110mm band, and 85mm +/- 20mm of
+    placement noise sits inside it for all three.
+
+    Like ``reset_ball_in_front_of_foot``, this reads the robot root from qpos
+    rather than ``root_link_pos_w`` (which lags until the next forward()), and
+    must therefore be registered AFTER reset_base in the event dict.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device)
+    names = _object_names(env)
+    robot: Entity = env.scene["robot"]
+
+    root = env.sim.data.qpos[env_ids][:, robot.indexing.free_joint_q_adr]
+    qw, qx, qy, qz = root[:, 3], root[:, 4], root[:, 5], root[:, 6]
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+
+    n = len(env_ids)
+    choice = torch.randint(0, len(names), (n,), device=env.device)
+    active = _active_object_idx(env)
+    active[env_ids] = choice
+
+    off = torch.tensor(offset, device=env.device, dtype=torch.float).repeat(n, 1)
+    off += (torch.rand(n, 2, device=env.device) * 2.0 - 1.0) * noise_xy
+    x_w = root[:, 0] + cos_y * off[:, 0] - sin_y * off[:, 1]
+    y_w = root[:, 1] + sin_y * off[:, 0] + cos_y * off[:, 1]
+    ground = env.scene.terrain.env_origins[env_ids, 2]
+
+    from mjlab_microduck.robot.microduck_constants import GRAB_HEIGHTS
+
+    obj_yaw = (torch.rand(n, device=env.device) * 2.0 - 1.0) * yaw_noise
+    for i, name in enumerate(names):
+        entity: Entity = env.scene[name]
+        is_active = choice == i
+        # Parked props are spread along y so they rest on the floor next to each
+        # other instead of interpenetrating, which would fling them.
+        park_y = root[:, 1] + _PARKED_OFFSET + 0.1 * i
+        pose = torch.zeros(n, 7, device=env.device)
+        pose[:, 0] = torch.where(is_active, x_w, root[:, 0])
+        pose[:, 1] = torch.where(is_active, y_w, park_y)
+        pose[:, 2] = ground + GRAB_HEIGHTS[name] / 2.0
+        pose[:, 3] = torch.cos(obj_yaw / 2.0)
+        pose[:, 6] = torch.sin(obj_yaw / 2.0)
+        entity.write_root_link_pose_to_sim(pose, env_ids)
+        entity.write_root_link_velocity_to_sim(
+            torch.zeros(n, 6, device=env.device), env_ids
+        )
+
+    # The lift potential is measured against the resting height, so it has to be
+    # re-based here or the first step of every episode books a phantom lift.
+    if hasattr(env, "_grab_prev_lift"):
+        env._grab_prev_lift[env_ids] = 0.0
+    if hasattr(env, "_grab_spawn_xy"):
+        env._grab_spawn_xy[env_ids, 0] = x_w
+        env._grab_spawn_xy[env_ids, 1] = y_w
+    else:
+        spawn = torch.zeros(env.num_envs, 2, device=env.device)
+        spawn[env_ids, 0] = x_w
+        spawn[env_ids, 1] = y_w
+        env._grab_spawn_xy = spawn
+
+
+def _object_lift(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """How far the active prop's centre is above where it rests, in metres."""
+    pos = _active_object_pos_w(env)
+    rest = _terrain_z(env) + _grab_heights(env) / 2.0
+    return torch.nan_to_num(pos[:, 2] - rest, nan=0.0)
+
+
+def _beak_contact(env: ManagerBasedRlEnv, sensor_prefix: str) -> torch.Tensor:
+    """1.0 where the beak is touching the env's ACTIVE prop this step.
+
+    One sensor per prop, gathered through the active index. A contact sensor's
+    secondary pattern is only treated as a regex when it is scoped to a single
+    entity, so "the beak against any prop" cannot be expressed as one sensor —
+    and gathering is the more honest form anyway, since a parked prop that
+    happened to be touched would otherwise read as a grab.
+    """
+    names = _object_names(env)
+    per_object = []
+    for name in names:
+        sensor = env.scene.sensors.get(f"{sensor_prefix}_{name}")
+        if sensor is None:
+            return torch.zeros(env.num_envs, device=env.device)
+        found = sensor.data.found
+        per_object.append((found.view(found.shape[0], -1) > 0).any(dim=-1).float())
+    stacked = torch.stack(per_object, dim=1)  # (N, n_objects)
+    return torch.gather(stacked, 1, _active_object_idx(env).view(-1, 1)).squeeze(1)
+
+
+def _upright_and_standing(
+    env: ManagerBasedRlEnv, min_height: float, tilt_limit: float
+) -> torch.Tensor:
+    """1.0 where the trunk is level and at standing height.
+
+    Without this the policy can "hold" the object by collapsing onto it and
+    pinning it, which satisfies height and contact but is not a pick.
+    """
+    robot: Entity = env.scene["robot"]
+    height = robot.data.root_link_pos_w[:, 2] - _terrain_z(env)
+    tilt = torch.nan_to_num(robot.data.projected_gravity_b[:, :2], nan=1.0).norm(dim=-1)
+    return ((height > min_height) & (tilt < tilt_limit)).float()
+
+
+def object_lift_progress(
+    env: ManagerBasedRlEnv,
+    max_paid_rate: float = 0.12,
+    target_lift: float = 0.06,
+) -> torch.Tensor:
+    """Potential-based reward on raising the object — the main task term.
+
+    Pays Δ(lift) per second against a frontier, capped at ``max_paid_rate``
+    m/s of paid rise and at ``target_lift`` total. Lifting pays, holding at
+    height pays zero (``object_hold`` covers that), and dropping does not
+    refund, so there is nothing to farm by bouncing the object.
+
+    The cap is the anti-jackpot guard from `roulade_progress`: without it,
+    flicking the object into the air collects the entire potential in two
+    steps, and the cheapest way to do that is a violent head-whip rather than
+    a grip.
+    """
+    lift = _object_lift(env).clamp(min=0.0, max=target_lift)
+    previous = getattr(env, "_grab_prev_lift", None)
+    if previous is None or previous.shape != lift.shape:
+        previous = torch.zeros_like(lift)
+    delta = (lift - previous).clamp(min=0.0)
+    delta = torch.where(
+        env.episode_length_buf <= 1, torch.zeros_like(delta), delta
+    )
+    delta = delta.clamp(max=max_paid_rate * env.step_dt)
+    env._grab_prev_lift = torch.maximum(previous, lift)
+    return delta / (env.step_dt * target_lift)
+
+
+def object_hold(
+    env: ManagerBasedRlEnv,
+    sensor_prefix: str = "beak_contact",
+    clearance: float = 0.02,
+    min_height: float = 0.09,
+    tilt_limit: float = 0.35,
+) -> torch.Tensor:
+    """Pay per step while the object is genuinely held. This IS the 3s target.
+
+    Three gates, each closing a specific exploit:
+
+    * **clearance** — the object is off the ground by a margin, so shoving it
+      along the floor is not progress;
+    * **beak contact** — the object is touching the beak, so balancing it on
+      the head or trapping it against a foot does not count;
+    * **upright and standing** — so falling onto the object and pinning it
+      does not count.
+
+    Note what is absent: nothing rewards the jaw for being closed. If closure
+    paid, the policy would chomp on air, and it would do it immediately
+    because that is free. Closure only pays through this term, and only when
+    the object is actually up.
+    """
+    lift = _object_lift(env)
+    off_ground = (lift > clearance).float()
+    contact = _beak_contact(env, sensor_prefix)
+    posture = _upright_and_standing(env, min_height, tilt_limit)
+    return off_ground * contact * posture
+
+
+def object_hold_success(
+    env: ManagerBasedRlEnv,
+    sensor_prefix: str = "beak_contact",
+    clearance: float = 0.02,
+    min_height: float = 0.09,
+    tilt_limit: float = 0.35,
+    required_s: float = 3.0,
+) -> torch.Tensor:
+    """1.0 once the object has been held CONTINUOUSLY for ``required_s``.
+
+    Logged as a reward term at weight 0 so it shows up in wandb as a real
+    success criterion rather than a proxy: "held, in the beak, robot upright,
+    for three seconds" is the thing that was asked for, and total reward can
+    rise a long way without it ever happening.
+    """
+    holding = object_hold(env, sensor_prefix, clearance, min_height, tilt_limit)
+    streak = getattr(env, "_grab_hold_streak", None)
+    if streak is None or streak.shape != holding.shape:
+        streak = torch.zeros_like(holding)
+    streak = torch.where(
+        env.episode_length_buf <= 1, torch.zeros_like(streak), streak
+    )
+    streak = (streak + env.step_dt) * holding
+    env._grab_hold_streak = streak
+    # Half a step of slack: the streak is a float32 sum of 150 x 0.02, which
+    # lands just under 3.0 and would otherwise never fire.
+    return (streak >= required_s - 0.5 * env.step_dt).float()
+
+
+def mouth_to_object(
+    env: ManagerBasedRlEnv,
+    std: float = 0.04,
+    coarse_std: float = 0.13,
+    max_lift: float = 0.01,
+    asset_cfg: SceneEntityCfg = _JAW_TIP_CFG,
+) -> torch.Tensor:
+    """Two-scale Gaussian on beak-to-object distance, active on the approach.
+
+    Pure shaping: it gets the beak to the object, which random exploration
+    would otherwise almost never do. It switches off once the object is off
+    the ground (``max_lift``) so it cannot be farmed by hovering the beak next
+    to an object it has already picked up, and so it never competes with the
+    lift and hold terms it exists to bootstrap.
+
+    TWO stds, because one cannot do both jobs here. Measured on this model, a
+    standing v2 robot's ``jaw_tip`` sits ~0.21m from a prop placed at the
+    nominal 85mm: a single std sized to the error that actually matters at the
+    end (~0.04m, roughly the beak's own scale) evaluates to exp(-27) at the
+    start — numerically zero, no gradient, nothing to climb. ``coarse_std``
+    covers the descent and ``std`` sharpens the last few centimetres, which is
+    the standard fix for "the reward is right but the current policy cannot
+    see it".
+    """
+    distance = (_beak_site_pos_w(env, asset_cfg) - _active_object_pos_w(env)).norm(dim=-1)
+    distance = torch.nan_to_num(distance, nan=1.0)
+    approaching = (_object_lift(env) < max_lift).float()
+    fine = torch.exp(-((distance / std) ** 2))
+    coarse = torch.exp(-((distance / coarse_std) ** 2))
+    return approaching * 0.5 * (fine + coarse)
+
+
+def object_disturb_penalty(
+    env: ManagerBasedRlEnv,
+    max_lift: float = 0.01,
+    tolerance: float = 0.02,
+    scale: float = 10.0,
+) -> torch.Tensor:
+    """Self-negating penalty for shoving the object around before lifting it.
+
+    Returns ≤ 0, so it takes a POSITIVE weight. This is the term that stops
+    the beak from batting the rubber ball away as it comes in: a policy that
+    approaches fast and flat knocks the prop out of its own reach, and without
+    a price on that it will keep doing it because the approach reward is
+    collected on the way in either way.
+
+    Only charged BEFORE the lift — once the object is up, moving it
+    horizontally is carrying it, which is the point.
+    """
+    spawn = getattr(env, "_grab_spawn_xy", None)
+    if spawn is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    displacement = (_active_object_pos_w(env)[:, :2] - spawn).norm(dim=-1)
+    displacement = torch.nan_to_num(displacement, nan=0.0)
+    excess = (displacement - tolerance).clamp(min=0.0)
+    before_lift = (_object_lift(env) < max_lift).float()
+    return -before_lift * (scale * excess).clamp(max=3.0) ** 2
+
+
+def object_pos_in_base(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Active prop position in the robot's body frame — CRITIC-only.
+
+    The actor gets the object through the command slot (a target point the
+    perception stack supplies), exactly as it will at deployment. The critic
+    gets the truth, so the value function is not guessing at a state the actor
+    cannot see. Same asymmetric split the ball-kick env uses.
+    """
+    robot: Entity = env.scene["robot"]
+    delta = _active_object_pos_w(env) - robot.data.root_link_pos_w
+    rot = matrix_from_quat(robot.data.root_link_quat_w)
+    return torch.nan_to_num(torch.bmm(rot.transpose(1, 2), delta.unsqueeze(-1)).squeeze(-1), nan=0.0)
+
+
+def object_vel_in_base(env: ManagerBasedRlEnv) -> torch.Tensor:
+    robot: Entity = env.scene["robot"]
+    rot = matrix_from_quat(robot.data.root_link_quat_w)
+    vel = _active_object_vel_w(env)
+    return torch.nan_to_num(torch.bmm(rot.transpose(1, 2), vel.unsqueeze(-1)).squeeze(-1), nan=0.0)
+
+
+def object_lift_obs(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Scalar lift of the active prop — CRITIC-only, for the same reason."""
+    return _object_lift(env).unsqueeze(-1)
+
+
+def grab_target_command(
+    env: ManagerBasedRlEnv, command_name: str = "body_pose"
+) -> torch.Tensor:
+    """Body-pose slot repurposed as the grab target point.
+
+    Slots [0:3] carry the object's target position in the robot frame — the
+    same (dx, dy, dz) that the detector produces and that render_pov.py labels.
+    Slots [3:6] stay at their small sampled values so those input neurons keep
+    receiving signal and are still usable by a later curriculum: a command
+    input that is never non-zero has dead weights forever.
+    """
+    command = env.command_manager.get_command(command_name).clone()
+    target = object_pos_in_base(env)
+    noise = getattr(env.cfg, "grab_target_noise", 0.0)
+    if noise > 0.0:
+        target = target + (torch.rand_like(target) * 2.0 - 1.0) * noise
+    command[:, :3] = target
+    return command
