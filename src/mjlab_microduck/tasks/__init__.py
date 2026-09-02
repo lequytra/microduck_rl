@@ -71,6 +71,10 @@ from .microduck_goto_point_env_cfg import (
     make_microduck_goto_point_env_cfg,
     MicroduckGoToPointRlCfg,
 )
+from .microduck_object_pick_env_cfg import (
+    make_microduck_object_pick_env_cfg,
+    MicroduckObjectPickRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -244,6 +248,17 @@ register_mjlab_task(
     env_cfg=make_microduck_goto_point_env_cfg(rough=True),
     play_env_cfg=make_microduck_goto_point_env_cfg(play=True, rough=True),
     rl_cfg=MicroduckGoToPointRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# ObjectPick — v2 targeted grab on the 15-servo jaw model. NOTE: 64D obs / 15
+# actions, so this policy is NOT interchangeable with the 61D v1 family; the
+# runtime must load it against the v2 robot.
+register_mjlab_task(
+    task_id="Mjlab-ObjectPick-Flat-MicroDuck",
+    env_cfg=make_microduck_object_pick_env_cfg(),
+    play_env_cfg=make_microduck_object_pick_env_cfg(play=True),
+    rl_cfg=MicroduckObjectPickRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
