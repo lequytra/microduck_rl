@@ -1,0 +1,23 @@
+<mujoco model="microduck_object_sock">
+    <!-- Sock: 60 x 34 x 14 mm, 10 g. Grab height = 14 mm, the LOWEST of the
+         three, so it demands the deepest crouch and is the binding case for the
+         reach envelope (scripts/measure_v2_reach.py answers whether it is
+         reachable at all on the current model).
+
+         A real sock is deformable and MuJoCo Warp has no good way to simulate
+         that, so it is approximated as a light, very high-friction, low-profile
+         box. That approximation flatters the task: a real sock would deform
+         around the beak (easier to hold) but also snag and drag (harder to
+         lift). Treat sock results here as the least trustworthy of the three
+         and confirm them under manual teleop before believing them. -->
+    <worldbody>
+        <body name="sock" pos="0.2 0.6 0.007">
+            <freejoint name="sock_free"/>
+            <inertial pos="0 0 0" mass="0.010" diaginertia="1.13e-6 3.16e-6 3.79e-6"/>
+            <geom name="sock_geom" type="box" size="0.030 0.017 0.007"
+                  condim="4" friction="1.5 0.03 0.002" solref="0.01 1"
+                  solimp="0.95 0.99 0.001 0.5 2" priority="2"
+                  rgba="0.25 0.35 0.75 1"/>
+        </body>
+    </worldbody>
+</mujoco>

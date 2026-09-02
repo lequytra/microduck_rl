@@ -1,0 +1,21 @@
+<mujoco model="microduck_object_block">
+    <!-- Wooden block: 26 x 26 x 20 mm, ~600 kg/m^3. The forgiving prop: it does
+         not roll away from an imperfect approach and it sits flat.
+         Grab height (top surface at rest) = 20 mm.
+
+         Contacts are deliberately soft (solref time constant ~2x the sim step)
+         and friction is high with condim 4: a rigid beak has no compliance of
+         its own, so all of the grip tolerance has to come from the contact
+         model. priority 2 makes these values win the pairwise blend against
+         the beak geoms rather than being averaged with them. -->
+    <worldbody>
+        <body name="block" pos="0.2 0 0.010">
+            <freejoint name="block_free"/>
+            <inertial pos="0 0 0" mass="0.012" diaginertia="1.08e-6 1.08e-6 1.35e-6"/>
+            <geom name="block_geom" type="box" size="0.013 0.013 0.010"
+                  condim="4" friction="0.9 0.02 0.001" solref="0.01 1"
+                  solimp="0.95 0.99 0.001 0.5 2" priority="2"
+                  rgba="0.72 0.53 0.30 1"/>
+        </body>
+    </worldbody>
+</mujoco>
