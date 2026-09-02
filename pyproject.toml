@@ -22,6 +22,11 @@ dependencies = [
     "rustypot>=1.4.2",
     "huggingface_hub>=0.27.0",
     "matplotlib>=3.10.9",
+    # Direct dep because scripts/render_pov.py imports PIL to write the POV
+    # dataset. It already arrives transitively via matplotlib, but a fresh
+    # `uv sync` is the ground truth and transitive imports are how remote runs
+    # break.
+    "pillow>=11.0",
     # mjlab 1.3.0 imports scipy (terrains/heightfield_terrains.py) but forgets
     # to declare it — without this line a fresh `uv sync` (e.g. on HF jobs)
     # can't even `import mjlab_microduck` (found 2026-07-21).

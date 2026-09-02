@@ -24,6 +24,22 @@ MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
 # leg to 10-14, which would silently break every v1 cfg that hardcodes
 # _LEG_JOINTS = [0..4, 9..13].
 MICRODUCK_JAW_XML: Path = _ROBOT_DIR / "robot_allcollisions_jaw.xml"
+# Grabbable props for the v2 ObjectPick task. One file per prop because mjlab
+# needs one entity per free body (write_root_link_pose_to_sim addresses a single
+# root); objects.xml is an aggregate of the three for the standalone CPU tools.
+MICRODUCK_OBJECTS_XML: Path = _ROBOT_DIR / "objects.xml"
+MICRODUCK_OBJECT_XMLS: dict[str, Path] = {
+    "block": _ROBOT_DIR / "object_block.xml",
+    "rubber_ball": _ROBOT_DIR / "object_rubber_ball.xml",
+    "sock": _ROBOT_DIR / "object_sock.xml",
+}
+# Height of each prop's top surface at rest — how far down the beak has to get.
+# Kept in sync with the geom sizes in the files above.
+GRAB_HEIGHTS: dict[str, float] = {
+    "block": 0.020,
+    "rubber_ball": 0.030,
+    "sock": 0.014,
+}
 # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
 MICRODUCK_ALLCOLLISIONS_ROLLERS_XML: Path = _ROBOT_DIR / "robot_allcollisions_rollers.xml"
 # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
@@ -37,6 +53,9 @@ assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
 assert MICRODUCK_ALLCOLLISIONS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_XML}"
 assert MICRODUCK_BALL_XML.exists(), f"XML not found: {MICRODUCK_BALL_XML}"
 assert MICRODUCK_JAW_XML.exists(), f"XML not found: {MICRODUCK_JAW_XML}"
+assert MICRODUCK_OBJECTS_XML.exists(), f"XML not found: {MICRODUCK_OBJECTS_XML}"
+for _name, _path in MICRODUCK_OBJECT_XMLS.items():
+    assert _path.exists(), f"XML not found: {_path}"
 assert MICRODUCK_ALLCOLLISIONS_ROLLERS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_ROLLERS_XML}"
 assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
 assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BACKLASH_XML}"
@@ -67,6 +86,16 @@ def get_ball_spec() -> mujoco.MjSpec:
 
 def get_jaw_spec() -> mujoco.MjSpec:
     return mujoco.MjSpec.from_file(str(MICRODUCK_JAW_XML))
+
+
+def _make_object_spec_fn(name: str):
+    path = MICRODUCK_OBJECT_XMLS[name]
+
+    def _spec_fn() -> mujoco.MjSpec:
+        return mujoco.MjSpec.from_file(str(path))
+
+    _spec_fn.__name__ = f"get_{name}_spec"
+    return _spec_fn
 
 
 def get_backlash_spec() -> mujoco.MjSpec:
@@ -275,6 +304,19 @@ MICRODUCK_JAW_ROBOT_CFG = EntityCfg(
         soft_joint_pos_limit_factor=0.9,
     ),
 )
+
+# Wooden block / rubber ball / sock props for the v2 ObjectPick task. All three
+# live in the scene at once; each episode activates one and parks the others to
+# the side (see mdp.reset_grab_object), which is how one policy learns to handle
+# all three rather than three policies learning one each. Init positions here
+# only matter for the pristine pre-first-reset state.
+MICRODUCK_OBJECT_CFGS: dict[str, EntityCfg] = {
+    name: EntityCfg(
+        spec_fn=_make_object_spec_fn(name),
+        init_state=EntityCfg.InitialStateCfg(pos=(0.3, 0.3 * i, GRAB_HEIGHTS[name] / 2)),
+    )
+    for i, name in enumerate(MICRODUCK_OBJECT_XMLS)
+}
 
 # Free-floating, non-articulated ball prop for the BallKick task. Position is
 # set each episode by the reset_ball_in_front_of_foot event; the init pos here
